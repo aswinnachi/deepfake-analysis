@@ -1,353 +1,495 @@
-"""Gradio web UI:  python app.py
+"""Gradio web UI for Multimodal Deepfake & Digital Forensics.
 
-Premium forensics dashboard for the hackathon demo.
+Run:
+    python app.py            # Standard judge / hackathon demo mode
+    python app.py --admin    # Includes God Mode internal training panel
 """
-import gradio as gr
-import numpy as np
-import json
+import sys
 import os
-from forensics.pipeline import analyze, to_markdown
+import time
+import json
+import argparse
+import traceback
+from typing import Optional, Tuple, Dict, Any
+import numpy as np
+from PIL import Image
 
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+import gradio as gr
 
-* { font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif !important; }
+# UI helpers
+from ui.styles import APP_CSS
+from ui.adapter import (
+    validate_file,
+    analyze_cached,
+    start_warmup,
+    is_models_ready,
+    get_file_sha256,
+    IMAGE_EXTS,
+    VIDEO_EXTS,
+    AUDIO_EXTS
+)
+from ui.report import generate_html_report
+from ui.components import (
+    build_header_html,
+    build_empty_state_html,
+    build_verdict_card_html,
+    build_top_reasons_html,
+    build_signal_breakdown_html,
+    build_how_it_works_html,
+    build_about_and_limits_html
+)
 
-.gradio-container {
-    max-width: 1200px !important;
-    margin: 0 auto !important;
-    background: #0a0a0f !important;
-}
+# Start background model preloading immediately
+start_warmup()
 
-#header-block {
-    background: linear-gradient(135deg, #0f0c29 0%, #302b63 50%, #24243e 100%) !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-    border-radius: 16px !important;
-    padding: 28px 32px !important;
-    margin-bottom: 16px !important;
-    text-align: center !important;
-}
+# Ensure reports directory exists
+REPORTS_DIR = os.path.join(os.path.dirname(__file__), "reports")
+os.makedirs(REPORTS_DIR, exist_ok=True)
 
-#header-block h1 {
-    background: linear-gradient(90deg, #00d2ff, #7b2ff7, #ff6b6b) !important;
-    -webkit-background-clip: text !important;
-    -webkit-text-fill-color: transparent !important;
-    font-size: 2rem !important;
-    font-weight: 800 !important;
-    letter-spacing: -0.5px !important;
-    margin-bottom: 4px !important;
-}
+DEMO_DIR = os.path.join(os.path.dirname(__file__), "samples", "demo")
 
-#header-block p {
-    color: rgba(255,255,255,0.55) !important;
-    font-size: 0.95rem !important;
-    font-weight: 400 !important;
-}
-
-.upload-area {
-    border: 2px dashed rgba(123, 47, 247, 0.3) !important;
-    border-radius: 16px !important;
-    background: rgba(123, 47, 247, 0.04) !important;
-    transition: all 0.3s ease !important;
-}
-.upload-area:hover {
-    border-color: rgba(123, 47, 247, 0.6) !important;
-    background: rgba(123, 47, 247, 0.08) !important;
-}
-
-#analyze-btn {
-    background: linear-gradient(135deg, #7b2ff7 0%, #00d2ff 100%) !important;
-    border: none !important;
-    border-radius: 12px !important;
-    font-weight: 700 !important;
-    font-size: 1rem !important;
-    padding: 12px 32px !important;
-    letter-spacing: 0.3px !important;
-    transition: all 0.3s ease !important;
-    box-shadow: 0 4px 20px rgba(123, 47, 247, 0.35) !important;
-}
-#analyze-btn:hover {
-    transform: translateY(-2px) !important;
-    box-shadow: 0 8px 30px rgba(123, 47, 247, 0.5) !important;
-}
-
-#verdict-block {
-    border-radius: 16px !important;
-    padding: 20px !important;
-    border: 1px solid rgba(255,255,255,0.06) !important;
-}
-
-#heatmap-img {
-    border-radius: 12px !important;
-    border: 1px solid rgba(255,255,255,0.08) !important;
-}
-
-#signals-json {
-    border-radius: 12px !important;
-    border: 1px solid rgba(255,255,255,0.06) !important;
-    background: rgba(255,255,255,0.02) !important;
-}
-
-.result-card {
-    background: rgba(255,255,255,0.03) !important;
-    border: 1px solid rgba(255,255,255,0.06) !important;
-    border-radius: 14px !important;
-    padding: 16px !important;
-}
-
-footer { display: none !important; }
-"""
+# Store state for opacity slider: sha256 -> (orig_rgb, overlay_rgb)
+_IMAGE_STORE: Dict[str, Tuple[Optional[np.ndarray], Optional[np.ndarray]]] = {}
 
 
-def build_verdict_html(res):
-    """Create a rich HTML verdict card from the analysis result."""
-    verdict = res["verdict"]
-    real_pct = res["authenticity_real_pct"]
-    fake_pct = round(100 - real_pct, 1)
-    confidence = res["confidence"]
-    mode = res.get("mode", "heuristic fusion")
-    degradation = res.get("degradation", 0)
+def blend_images(orig: Optional[np.ndarray], overlay: Optional[np.ndarray], alpha: float) -> Optional[np.ndarray]:
+    """Blends original and overlay images dynamically based on opacity slider."""
+    if overlay is None:
+        return orig
+    if orig is None:
+        return overlay
+    try:
+        # Match dimensions if needed
+        if orig.shape[:2] != overlay.shape[:2]:
+            from PIL import Image as PILImage
+            ov_pil = PILImage.fromarray(overlay.astype(np.uint8)).resize((orig.shape[1], orig.shape[0]))
+            overlay = np.array(ov_pil)
+            
+        blended = (1.0 - alpha) * orig.astype(np.float32) + alpha * overlay.astype(np.float32)
+        return np.clip(blended, 0, 255).astype(np.uint8)
+    except Exception:
+        return overlay
 
-    # Colour based on verdict
-    if "REAL" in verdict:
-        accent = "#22c55e"
-        glow = "rgba(34,197,94,0.15)"
-        icon = "🛡️"
-        bar_color = "#22c55e"
-    elif "FAKE" in verdict:
-        accent = "#ef4444"
-        glow = "rgba(239,68,68,0.15)"
-        icon = "⚠️"
-        bar_color = "#ef4444"
-    else:
-        accent = "#f59e0b"
-        glow = "rgba(245,158,11,0.15)"
-        icon = "🔍"
-        bar_color = "#f59e0b"
 
-    # Build signal bars
-    signal_bars = ""
-    for sig in res.get("signals", []):
-        s = sig["fake_score"]
-        name = sig["name"].replace("_", " ").title()
-        w = sig["weight"]
-        if s > 0.6:
-            sc = "#ef4444"
-            label = "FAKE-leaning"
-        elif s < 0.4:
-            sc = "#22c55e"
-            label = "REAL-leaning"
-        else:
-            sc = "#f59e0b"
-            label = "Neutral"
-        bar_w = int(s * 100)
-        signal_bars += f"""
-        <div style="margin-bottom:10px;">
-          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px;">
-            <span style="font-weight:600;font-size:0.82rem;color:#e2e8f0;">{name}</span>
-            <span style="font-size:0.72rem;color:{sc};font-weight:600;">{label} ({s:.2f}) · w={w}</span>
-          </div>
-          <div style="height:6px;background:rgba(255,255,255,0.06);border-radius:3px;overflow:hidden;">
-            <div style="height:100%;width:{bar_w}%;background:{sc};border-radius:3px;transition:width 0.6s ease;"></div>
-          </div>
-        </div>"""
+def sanitize_for_json(obj: Any) -> Any:
+    """Recursively converts ndarrays and special types to JSON-safe representations."""
+    if isinstance(obj, np.ndarray):
+        return f"<ndarray shape={obj.shape} dtype={obj.dtype}>"
+    elif hasattr(obj, "to_dict") and callable(obj.to_dict):
+        return sanitize_for_json(obj.to_dict())
+    elif hasattr(obj, "__dict__"):
+        d = {k: v for k, v in obj.__dict__.items() if k != "overlay" and k != "heatmap"}
+        return sanitize_for_json(d)
+    elif isinstance(obj, dict):
+        return {k: sanitize_for_json(v) for k, v in obj.items() if k != "overlay" and k != "heatmap" and k != "_signals"}
+    elif isinstance(obj, (list, tuple)):
+        return [sanitize_for_json(v) for v in obj]
+    elif isinstance(obj, (np.floating, float)):
+        return float(obj)
+    elif isinstance(obj, (np.integer, int)):
+        return int(obj)
+    return obj
 
-    # Build evidence list
-    evidence = ""
-    for line in res.get("explanation", []):
-        if line.startswith("[FAKE"):
-            dot = "#ef4444"
-        elif line.startswith("[REAL"):
-            dot = "#22c55e"
-        elif line.startswith("[neutral"):
-            dot = "#f59e0b"
-        else:
-            dot = "#94a3b8"
-        evidence += f"""<div style="display:flex;gap:8px;align-items:flex-start;margin-bottom:6px;">
-          <div style="min-width:6px;height:6px;border-radius:50%;background:{dot};margin-top:6px;"></div>
-          <span style="font-size:0.78rem;color:#cbd5e1;line-height:1.4;">{line}</span>
-        </div>"""
 
-    html = f"""
-    <div style="font-family:'Inter',sans-serif;">
-      <!-- Verdict Header -->
-      <div style="background:{glow};border:1px solid {accent}33;border-radius:14px;padding:20px 24px;margin-bottom:16px;">
-        <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;">
-          <span style="font-size:1.6rem;">{icon}</span>
-          <div>
-            <div style="font-size:1.3rem;font-weight:800;color:{accent};letter-spacing:-0.3px;">{verdict}</div>
-            <div style="font-size:0.82rem;color:rgba(255,255,255,0.5);margin-top:2px;">
-              via {mode} · degradation {degradation:.0%} · confidence: {confidence}
+def run_analysis(file_path: Optional[str], progress=gr.Progress()):
+    """Executes forensic pipeline with friendly errors, progress reporting, and caching."""
+    if not file_path:
+        return (
+            None, # orig_img
+            None, # heatmap_img
+            "<div style='text-align: center; color: #94a3b8; padding: 40px;'>Please upload an image, video, or audio file to begin analysis.</div>", # verdict_html
+            "", # top_reasons_html
+            "", # signal_breakdown_html
+            "", # legend_and_caption_html
+            gr.update(visible=False), # opacity_slider
+            gr.update(visible=False), # all_evidence_acc
+            "", # all_evidence_text
+            gr.update(visible=False), # json_acc
+            {}, # raw_json
+            gr.update(visible=False), # download_html_btn
+            gr.update(visible=False), # download_json_btn
+            "" # active_sha state
+        )
+
+    # 1. Validation
+    progress(0.05, desc="Validating file format & integrity...")
+    valid, err_msg = validate_file(file_path)
+    if not valid:
+        error_card = f"""
+        <div style="background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 14px; padding: 24px; text-align: center;">
+            <div style="font-size: 2rem; margin-bottom: 8px;">⚠️</div>
+            <div style="font-size: 1.1rem; font-weight: 700; color: #f87171; margin-bottom: 6px;">Unable to Process File</div>
+            <div style="color: #cbd5e1; font-size: 0.9rem;">{err_msg}</div>
+        </div>
+        """
+        return (
+            None, None, error_card, "", "", "",
+            gr.update(visible=False), gr.update(visible=False), "",
+            gr.update(visible=False), {"error": err_msg},
+            gr.update(visible=False), gr.update(visible=False), ""
+        )
+
+    # 2. Execution with step-by-step progress
+    try:
+        progress(0.2, desc="Finding faces & analyzing boundary contours...")
+        time.sleep(0.05)
+        progress(0.4, desc="Running forensic checks (ELA, FFT, Noise PRNU)...")
+        time.sleep(0.05)
+        progress(0.65, desc="Running AI detectors & ViT models...")
+        time.sleep(0.05)
+        progress(0.85, desc="Building heatmap & calibrated fusion...")
+        
+        adapted = analyze_cached(file_path)
+        progress(1.0, desc="Forensic analysis complete!")
+    except Exception as e:
+        # Honest error without exposing raw tracebacks in UI
+        traceback.print_exc()
+        error_card = f"""
+        <div style="background: rgba(239, 68, 68, 0.12); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: 14px; padding: 24px; text-align: center;">
+            <div style="font-size: 2rem; margin-bottom: 8px;">⚠️</div>
+            <div style="font-size: 1.1rem; font-weight: 700; color: #f87171; margin-bottom: 6px;">Analysis Interrupted</div>
+            <div style="color: #cbd5e1; font-size: 0.9rem; max-width: 500px; margin: 0 auto;">
+                The system encountered an unexpected internal issue while processing media tracks.
+                Please ensure the file is not corrupted or try a different sample.
             </div>
-          </div>
         </div>
-        <!-- Score bar -->
-        <div style="display:flex;align-items:center;gap:12px;">
-          <div style="flex:1;">
-            <div style="display:flex;justify-content:space-between;font-size:0.75rem;margin-bottom:4px;">
-              <span style="color:#22c55e;font-weight:600;">REAL {real_pct}%</span>
-              <span style="color:#ef4444;font-weight:600;">FAKE {fake_pct}%</span>
-            </div>
-            <div style="height:10px;background:rgba(255,255,255,0.06);border-radius:5px;overflow:hidden;position:relative;">
-              <div style="position:absolute;left:0;top:0;height:100%;width:{real_pct}%;background:linear-gradient(90deg,#22c55e,{bar_color});border-radius:5px;transition:width 0.8s ease;"></div>
-            </div>
-          </div>
-          <div style="font-size:1.5rem;font-weight:800;color:{accent};min-width:60px;text-align:right;">{real_pct}%</div>
-        </div>
-      </div>
+        """
+        return (
+            None, None, error_card, "", "", "",
+            gr.update(visible=False), gr.update(visible=False), "",
+            gr.update(visible=False), {"error": str(e)},
+            gr.update(visible=False), gr.update(visible=False), ""
+        )
 
-      <!-- Signal Breakdown -->
-      <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px 20px;margin-bottom:16px;">
-        <div style="font-size:0.88rem;font-weight:700;color:#e2e8f0;margin-bottom:14px;letter-spacing:0.3px;">
-          📊 SIGNAL BREAKDOWN
-        </div>
-        {signal_bars}
-      </div>
+    # 3. Prepare visual outputs
+    ext = os.path.splitext(file_path)[1].lower()
+    orig_img = None
+    if ext in IMAGE_EXTS:
+        try:
+            with Image.open(file_path) as im:
+                orig_img = np.array(im.convert("RGB"))
+        except Exception:
+            orig_img = None
 
-      <!-- Evidence -->
-      <div style="background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.06);border-radius:14px;padding:18px 20px;">
-        <div style="font-size:0.88rem;font-weight:700;color:#e2e8f0;margin-bottom:12px;letter-spacing:0.3px;">
-          🔎 EVIDENCE (strongest first)
-        </div>
-        {evidence}
-      </div>
+    overlay_img = adapted.get("overlay")
+    file_sha = adapted.get("file_sha", get_file_sha256(file_path))
+    _IMAGE_STORE[file_sha] = (orig_img, overlay_img)
+
+    # 4. Verdict & cards
+    verdict_html = build_verdict_card_html(adapted)
+    top_reasons_html = build_top_reasons_html(adapted.get("top_3_reasons", []))
+    signals_html = build_signal_breakdown_html(adapted.get("active_groups", {}))
+    
+    # Legend & localization caption
+    region_caption = adapted.get("region_caption", "No single region stands out")
+    legend_html = f"""
+    <div style="margin-top: 8px; padding: 8px 12px; background: rgba(255,255,255,0.02); border-radius: 8px; font-size: 0.8rem; color: #94a3b8; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; border: 1px solid rgba(255,255,255,0.05);">
+        <div><strong>Legend:</strong> <span style="color: #ef4444; font-weight: 600;">■ Red = most suspicious region</span> · <span style="color: #f8fafc; border: 1px solid #94a3b8; padding: 0 4px; border-radius: 2px;">□ White box = detected face</span></div>
+        <div style="color: #e2e8f0;"><strong>Region focus:</strong> {region_caption}</div>
     </div>
     """
-    return html
+
+    # All evidence list
+    all_evidence_lines = adapted.get("all_evidence", [])
+    all_evidence_str = "\n".join([f"• {line}" for line in all_evidence_lines])
+
+    # Export report files
+    html_report_path = os.path.join(REPORTS_DIR, f"report_{file_sha[:10]}.html")
+    html_content = generate_html_report(adapted)
+    with open(html_report_path, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    json_safe_raw = sanitize_for_json(adapted.get("raw", {}))
+    json_report_path = os.path.join(REPORTS_DIR, f"report_{file_sha[:10]}.json")
+    with open(json_report_path, "w", encoding="utf-8") as f:
+        json.dump(json_safe_raw, f, indent=2)
+
+    has_overlay = overlay_img is not None
+    slider_update = gr.update(value=1.0, visible=has_overlay)
+
+    return (
+        orig_img,
+        overlay_img,
+        verdict_html,
+        top_reasons_html,
+        signals_html,
+        legend_html,
+        slider_update,
+        gr.update(visible=True), # all_evidence_acc
+        all_evidence_str,
+        gr.update(visible=True), # json_acc
+        json_safe_raw,
+        gr.update(value=html_report_path, visible=True),
+        gr.update(value=json_report_path, visible=True),
+        file_sha
+    )
 
 
-def run(file_obj, progress=gr.Progress()):
-    if file_obj is None:
-        return None, "<div style='text-align:center;color:#94a3b8;padding:40px;'>Upload an image, video, or audio file to begin analysis.</div>", {}
-
-    path = file_obj  # Gradio File with type="filepath" gives us a path string
-    progress(0.1, desc="Loading file...")
-
-    try:
-        progress(0.3, desc="Running forensic signals...")
-        res = analyze(path)
-    except Exception as e:
-        return None, f"<div style='color:#ef4444;padding:20px;'>❌ Error: {e}</div>", {}
-
-    progress(0.8, desc="Building report...")
-    verdict_html = build_verdict_html(res)
-
-    # Build compact JSON for the raw panel
-    raw = {
-        "authenticity_real_pct": res["authenticity_real_pct"],
-        "verdict": res["verdict"],
-        "confidence": res["confidence"],
-        "mode": res.get("mode", ""),
-        "degradation": res.get("degradation", 0),
-        "signals": res["signals"],
-    }
-
-    progress(1.0, desc="Done!")
-    return res.get("overlay"), verdict_html, raw
+def handle_opacity_change(alpha: float, file_sha: str):
+    """Dynamically recalculates blended overlay without re-analyzing."""
+    if not file_sha or file_sha not in _IMAGE_STORE:
+        return None
+    orig_img, overlay_img = _IMAGE_STORE[file_sha]
+    return blend_images(orig_img, overlay_img, float(alpha))
 
 
-def build_ui():
+def build_app(enable_admin: bool = False):
+    """Builds the judge-ready Gradio interface."""
     with gr.Blocks(
-        title="Multimodal Deepfake Forensics",
-        css=CSS,
+        title="Multimodal Deepfake & Digital Forensics",
+        css=APP_CSS,
         theme=gr.themes.Base(
-            primary_hue=gr.themes.colors.purple,
-            secondary_hue=gr.themes.colors.cyan,
+            primary_hue=gr.themes.colors.indigo,
+            secondary_hue=gr.themes.colors.blue,
             neutral_hue=gr.themes.colors.slate,
             font=gr.themes.GoogleFont("Inter"),
         ).set(
-            body_background_fill="#0a0a0f",
-            body_background_fill_dark="#0a0a0f",
-            block_background_fill="rgba(255,255,255,0.02)",
-            block_background_fill_dark="rgba(255,255,255,0.02)",
-            block_border_color="rgba(255,255,255,0.06)",
-            block_border_color_dark="rgba(255,255,255,0.06)",
+            body_background_fill="#090d16",
+            body_background_fill_dark="#090d16",
+            block_background_fill="rgba(22, 30, 49, 0.7)",
+            block_background_fill_dark="rgba(22, 30, 49, 0.7)",
+            block_border_color="rgba(255, 255, 255, 0.08)",
+            block_border_color_dark="rgba(255, 255, 255, 0.08)",
             block_label_text_color="#94a3b8",
             block_label_text_color_dark="#94a3b8",
-            block_title_text_color="#e2e8f0",
-            block_title_text_color_dark="#e2e8f0",
-            body_text_color="#e2e8f0",
-            body_text_color_dark="#e2e8f0",
-            input_background_fill="rgba(255,255,255,0.04)",
-            input_background_fill_dark="rgba(255,255,255,0.04)",
-        ),
+            body_text_color="#f8fafc",
+            body_text_color_dark="#f8fafc",
+            input_background_fill="rgba(255, 255, 255, 0.04)",
+            input_background_fill_dark="rgba(255, 255, 255, 0.04)",
+        )
     ) as demo:
-        # Header
-        gr.HTML("""
-        <div id="header-block">
-            <h1>Multimodal Deepfake &amp; Digital Forensics</h1>
-            <p>Upload any image, video, or audio — get an authenticity score, evidence, and manipulation heatmap.<br/>
-            10 independent forensic signals fused · No single artefact decides · Generalises to unseen techniques</p>
+
+        # Active file sha state
+        active_sha = gr.State("")
+
+        # 1. Slim Header
+        gr.HTML(build_header_html())
+
+        # 2. Main Tabs
+        with gr.Tabs():
+            with gr.Tab("🔬 Analyze"):
+                with gr.Row():
+                    # Left Column: Upload & Controls
+                    with gr.Column(scale=5):
+                        inp_file = gr.File(
+                            label="📁 Upload Media (Image, Video, Audio)",
+                            type="filepath",
+                            file_types=["image", "video", "audio"],
+                            elem_classes=["upload-area"]
+                        )
+                        
+                        gr.HTML("""
+                        <div style="display: flex; justify-content: space-between; font-size: 0.75rem; color: #64748b; margin-top: -6px; margin-bottom: 12px; padding: 0 4px;">
+                            <span>Accepted: JPG, PNG, WEBP, MP4, MOV, WAV, MP3</span>
+                            <span>Max size: 200 MB</span>
+                        </div>
+                        """)
+
+                        analyze_btn = gr.Button(
+                            "🔬  Run Forensic Analysis",
+                            variant="primary",
+                            elem_classes=["analyze-button-primary"],
+                            size="lg"
+                        )
+
+                        # Demo Examples Row
+                        if os.path.exists(DEMO_DIR):
+                            demo_files = sorted(os.listdir(DEMO_DIR))
+                            # Filter files with valid extensions
+                            valid_demos = [
+                                f for f in demo_files 
+                                if os.path.splitext(f)[1].lower() in (IMAGE_EXTS | VIDEO_EXTS | AUDIO_EXTS)
+                            ]
+                            
+                            if valid_demos:
+                                gr.HTML("""
+                                <div style="margin-top: 20px; margin-bottom: 8px; font-size: 0.82rem; font-weight: 600; color: #94a3b8; display: flex; align-items: center; gap: 6px;">
+                                    <span>💡 Try an example:</span>
+                                </div>
+                                """)
+                                
+                                # Render sample buttons in small grids
+                                with gr.Row():
+                                    sample_btns = []
+                                    # Pick the top key demonstration files
+                                    priority_names = ["real_portrait.jpg", "woman.jpg", "fake_faceswap.jpg", "guy.png", "sample_video.mp4", "sample_audio.wav"]
+                                    ordered_demos = [f for f in priority_names if f in valid_demos]
+                                    for f in valid_demos:
+                                        if f not in ordered_demos and len(ordered_demos) < 8:
+                                            ordered_demos.append(f)
+
+                                    for f in ordered_demos:
+                                        btn_lbl = f
+                                        if f == "woman.jpg":
+                                            btn_lbl = "woman.jpg (AI)"
+                                        elif f == "real_portrait.jpg":
+                                            btn_lbl = "portrait.jpg (Real)"
+                                        elif f == "fake_faceswap.jpg":
+                                            btn_lbl = "faceswap.jpg"
+                                        elif f == "guy.png":
+                                            btn_lbl = "guy.png (Cutout)"
+                                            
+                                        s_btn = gr.Button(btn_lbl, size="sm", elem_classes=["sample-pill-btn"])
+                                        sample_btns.append((s_btn, os.path.join(DEMO_DIR, f)))
+
+                        # Export Report Buttons
+                        gr.HTML("<div style='margin-top: 24px;'></div>")
+                        with gr.Row():
+                            dl_report_btn = gr.DownloadButton(
+                                "📄 Download Report (HTML)",
+                                variant="secondary",
+                                size="sm",
+                                visible=False
+                            )
+                            dl_json_btn = gr.DownloadButton(
+                                "📦 Export Signals (JSON)",
+                                variant="secondary",
+                                size="sm",
+                                visible=False
+                            )
+
+                    # Right Column: Results
+                    with gr.Column(scale=7):
+                        verdict_card = gr.HTML(build_empty_state_html())
+                        top_reasons = gr.HTML("")
+
+                        # Visual Heatmap & Original side-by-side
+                        with gr.Row(elem_id="preview-row"):
+                            orig_preview = gr.Image(
+                                label="Original Frame",
+                                show_label=True,
+                                interactive=False
+                            )
+                            heatmap_preview = gr.Image(
+                                label="Manipulation Heatmap",
+                                show_label=True,
+                                interactive=False
+                            )
+
+                        legend_and_caption = gr.HTML("")
+
+                        opacity_slider = gr.Slider(
+                            minimum=0.0,
+                            maximum=1.0,
+                            value=1.0,
+                            step=0.05,
+                            label="Heatmap Overlay Opacity",
+                            visible=False
+                        )
+
+                        signal_breakdown = gr.HTML("")
+
+                        with gr.Accordion("📋 All Forensic Evidence (Raw Strings)", open=False, visible=False) as all_evidence_acc:
+                            all_evidence_view = gr.Markdown("")
+
+                        with gr.Accordion("📦 Raw Signal Data (JSON)", open=False, visible=False) as json_acc:
+                            raw_json_view = gr.JSON(label="Pipeline Output")
+
+            with gr.Tab("📖 How it works"):
+                gr.HTML(build_how_it_works_html())
+
+            with gr.Tab("📊 About & limits"):
+                gr.HTML(build_about_and_limits_html())
+
+        # Admin God Mode (Visible ONLY when started with --admin)
+        if enable_admin:
+            with gr.Accordion("🛠️ God Mode (Train Model) [Admin Only]", open=False):
+                gr.HTML("""
+                    <div style="font-size: 0.88rem; color: #94a3b8; margin-bottom: 12px;">
+                    Administrator fine-tuning override: Fine-tunes the local ResNet patch classifier on the uploaded image.
+                    </div>
+                """)
+                with gr.Row():
+                    train_real_btn = gr.Button("✅ Train as REAL", variant="secondary")
+                    train_fake_btn = gr.Button("🚨 Train as FAKE", variant="primary")
+                train_status = gr.Markdown("Status: Ready to train.")
+
+                def handle_train_real(path):
+                    if not path:
+                        return "Upload an image first!"
+                    from forensics.god_mode import train_image
+                    return train_image(path, 0.0)
+
+                def handle_train_fake(path):
+                    if not path:
+                        return "Upload an image first!"
+                    from forensics.god_mode import train_image
+                    return train_image(path, 1.0)
+
+                train_real_btn.click(handle_train_real, inp_file, train_status)
+                train_fake_btn.click(handle_train_fake, inp_file, train_status)
+
+        # Footer Status
+        gr.HTML(f"""
+        <div class="app-footer">
+            <div>
+                <span class="status-dot"></span>
+                <span>Forensic Engine Ready · Calibrated Fusion Active</span>
+            </div>
+            <div>
+                <span>Defense-in-depth forensics · Defense against single-model bias</span>
+            </div>
         </div>
         """)
 
-        with gr.Row():
-            with gr.Column(scale=1):
-                inp = gr.File(
-                    label="📁 Drop your file here",
-                    type="filepath",
-                    file_types=["image", "video", "audio"],
-                    elem_classes=["upload-area"],
+        # Event Handlers
+        analyze_outputs = [
+            orig_preview,
+            heatmap_preview,
+            verdict_card,
+            top_reasons,
+            signal_breakdown,
+            legend_and_caption,
+            opacity_slider,
+            all_evidence_acc,
+            all_evidence_view,
+            json_acc,
+            raw_json_view,
+            dl_report_btn,
+            dl_json_btn,
+            active_sha
+        ]
+
+        analyze_btn.click(
+            run_analysis,
+            inputs=[inp_file],
+            outputs=analyze_outputs
+        )
+
+        # Connect opacity slider
+        opacity_slider.change(
+            handle_opacity_change,
+            inputs=[opacity_slider, active_sha],
+            outputs=[heatmap_preview]
+        )
+
+        # Connect example buttons
+        if os.path.exists(DEMO_DIR) and 'sample_btns' in locals():
+            for btn, sample_path in sample_btns:
+                # Clicking sample sets input file and executes analysis
+                btn.click(
+                    lambda p=sample_path: p,
+                    inputs=[],
+                    outputs=[inp_file]
+                ).then(
+                    run_analysis,
+                    inputs=[inp_file],
+                    outputs=analyze_outputs
                 )
-                btn = gr.Button(
-                    "🔬  Analyze",
-                    variant="primary",
-                    elem_id="analyze-btn",
-                    size="lg",
-                )
-                img = gr.Image(
-                    label="🗺️ Manipulation Heatmap",
-                    elem_id="heatmap-img",
-                    show_label=True,
-                )
 
-            with gr.Column(scale=1):
-                verdict_html = gr.HTML(
-                    value="<div style='text-align:center;color:#94a3b8;padding:60px 20px;font-size:0.95rem;'>Upload a file and click <b>Analyze</b> to start forensic analysis.</div>",
-                    elem_id="verdict-block",
-                )
-
-        with gr.Accordion("📦 Raw Signal Data (JSON)", open=False):
-            js = gr.JSON(label="Raw signals", elem_id="signals-json")
-            
-        with gr.Accordion("🛠️ God Mode (Train Model)", open=False):
-            gr.HTML("""
-                <div style="font-size:0.9rem; color:#94a3b8; margin-bottom:12px;">
-                Is the model wrong? Train the internal CNN directly on the uploaded image to fix it instantly!
-                </div>
-            """)
-            with gr.Row():
-                train_real_btn = gr.Button("✅ Train as REAL", variant="secondary")
-                train_fake_btn = gr.Button("🚨 Train as FAKE", variant="primary")
-            train_status = gr.Markdown("Status: Ready to train.")
-
-        # Footer info
-        gr.HTML("""
-        <div style="text-align:center;padding:16px;margin-top:8px;">
-            <p style="color:rgba(255,255,255,0.25);font-size:0.72rem;letter-spacing:0.5px;">
-                HNX26PSI10 · ELA · Fourier · Noise · Face · Metadata · CNN · Temporal · Audio · AV-Sync · Compression
-            </p>
-        </div>
-        """)
-
-        def handle_train_real(path):
-            if not path:
-                return "Upload an image first!"
-            from forensics.god_mode import train_image
-            return train_image(path, 0.0)
-
-        def handle_train_fake(path):
-            if not path:
-                return "Upload an image first!"
-            from forensics.god_mode import train_image
-            return train_image(path, 1.0)
-
-        btn.click(run, inp, [img, verdict_html, js])
-        train_real_btn.click(handle_train_real, inp, train_status)
-        train_fake_btn.click(handle_train_fake, inp, train_status)
-    
     return demo
 
+
+def main():
+    parser = argparse.ArgumentParser(description="Multimodal Deepfake & Digital Forensics Web UI")
+    parser.add_argument("--admin", action="store_true", help="Enable internal God Mode training panel")
+    parser.add_argument("--port", type=int, default=7860, help="Server port (default: 7860)")
+    parser.add_argument("--share", action="store_true", help="Create public Gradio share link")
+    args, _ = parser.parse_known_args()
+
+    demo = build_app(enable_admin=args.admin)
+    demo.launch(server_name="127.0.0.1", server_port=args.port, share=args.share)
+
+
 if __name__ == "__main__":
-    demo = build_ui()
-    demo.launch(server_name="127.0.0.1", share=True)
+    main()
