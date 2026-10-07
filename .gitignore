@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+data/real/*
+data/fake/*
+!data/real/.gitkeep
+!data/fake/.gitkeep
+models/*.pt
+models/*.joblib
+!models/deploy.prototxt
+!models/res10_300x300_ssd_iter_140000.caffemodel
+results/
+
+data/real_degraded/
+data/eval/
+data/real_camera/
