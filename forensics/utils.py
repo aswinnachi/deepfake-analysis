@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 import numpy as np
 import cv2
-
+from PIL import Image
 
 @dataclass
 class Signal:
@@ -19,25 +19,28 @@ class Signal:
         return {"name": self.name, "fake_score": round(float(self.score), 3),
                 "weight": self.weight, "detail": self.detail}
 
-
 def sigmoid(x: float) -> float:
     return float(1.0 / (1.0 + np.exp(-x)))
-
 
 def logit(p: float) -> float:
     p = min(max(float(p), 0.02), 0.98)
     return float(np.log(p / (1 - p)))
 
-
 def to_unit(x: float, lo: float, hi: float) -> float:
     return float(np.clip((x - lo) / (hi - lo + 1e-12), 0.0, 1.0))
 
-
 def load_rgb(path, max_side: int = 1600) -> np.ndarray:
-    bgr = cv2.imread(str(path), cv2.IMREAD_COLOR)
-    if bgr is None:
-        raise ValueError(f"Cannot read image: {path}")
-    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    """Load image as RGB. If image has alpha channel, composite onto gray (128)."""
+    pil_img = Image.open(str(path))
+    if pil_img.mode in ("RGBA", "LA") or (pil_img.mode == "P" and "transparency" in pil_img.info):
+        rgba = pil_img.convert("RGBA")
+        # Composite onto gray (128)
+        gray_bg = Image.new("RGBA", rgba.size, (128, 128, 128, 255))
+        composited = Image.alpha_composite(gray_bg, rgba).convert("RGB")
+        rgb = np.array(composited)
+    else:
+        rgb = np.array(pil_img.convert("RGB"))
+
     h, w = rgb.shape[:2]
     s = max(h, w)
     if s > max_side:

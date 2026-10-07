@@ -1,6 +1,7 @@
 """One entry point: analyze(path) for image, video or audio files."""
 import os
-from . import ela, frequency, noise, face, metadata, cnn, compression, audio, av_sync, video, hf_detector
+from . import ela, frequency, noise, face, metadata, cnn, compression, audio, av_sync, video
+from . import hf_detector, clip_probe, face_boundary, face_swap_cnn, provenance
 from .fusion import fuse
 from .utils import load_rgb
 from .visualize import overlay
@@ -9,32 +10,62 @@ IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 VID_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 AUD_EXT = {".wav", ".mp3", ".flac", ".m4a", ".ogg"}
 
-
 def _safe(fn, *a):
     try:
         return fn(*a)
-    except Exception as e:  # one failing module must not kill the report
+    except Exception as e:
         print(f"[warn] {getattr(fn, '__module__', fn)} failed: {e}")
         return None
 
-
 def analyze_array(rgb, path=None, use_learned=True):
     deg, note = compression.degradation(rgb)
-    sigs = [_safe(metadata.analyze, path) if path else None]
-    sigs += [_safe(m.analyze, rgb) for m in (ela, frequency, noise, face, cnn)]
+    sigs = []
+    
+    # 1. Metadata analysis
+    if path:
+        meta_sig = _safe(metadata.analyze, path)
+        if meta_sig:
+            sigs.append(meta_sig)
+            
+    # 2. Heuristic forensic modules
+    for m in (ela, frequency, noise, face, cnn):
+        s = _safe(m.analyze, rgb)
+        if s:
+            sigs.append(s)
+            
+    # 3. HF Detector Zoo
     hf_sigs = _safe(hf_detector.analyze, rgb)
     if hf_sigs:
         sigs += hf_sigs
+        
+    # 4. Learned CLIP Vision Probe
+    clip_sig = _safe(clip_probe.analyze, rgb)
+    if clip_sig:
+        sigs.append(clip_sig)
+        
+    # 5. Face Boundary & Regional Disagreement
+    fb_sigs = _safe(face_boundary.analyze, rgb)
+    if fb_sigs:
+        sigs += fb_sigs
+        
+    # 6. Face Swap CNN
+    fs_sig = _safe(face_swap_cnn.analyze, rgb)
+    if fs_sig:
+        sigs.append(fs_sig)
+        
+    # 7. Provenance, Watermarks & Cutouts
+    prov_sigs = _safe(provenance.analyze, rgb, path)
+    if prov_sigs:
+        sigs += prov_sigs
+
     res = fuse(sigs, deg, use_learned)
     res["explanation"].append(note)
     res["overlay"] = overlay(rgb, sigs)
     res["_signals"] = sigs
     return res
 
-
 def analyze_image(path, use_learned=True):
     return analyze_array(load_rgb(path), path, use_learned)
-
 
 def analyze_video(path):
     frames = video.sample_frames(path)
@@ -58,14 +89,12 @@ def analyze_video(path):
     res["overlay"] = overlay(worst, sigs)
     return res
 
-
 def analyze_audio(path):
     y, sr = audio.load_audio(path)
     sigs = audio.analyze(y, sr)
     res = fuse(sigs, 0.0, use_learned=False)
     res["overlay"] = None
     return res
-
 
 def analyze(path):
     ext = os.path.splitext(path)[1].lower()
@@ -76,7 +105,6 @@ def analyze(path):
     if ext in AUD_EXT:
         return analyze_audio(path)
     raise ValueError(f"Unsupported file type: {ext}")
-
 
 def to_markdown(res):
     lines = [f"## {res['verdict']}",

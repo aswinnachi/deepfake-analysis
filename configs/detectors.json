@@ -1,0 +1,20 @@
+[
+  {
+    "key": "hf_ai_image",
+    "model_id": "umm-maybe/AI-image-detector",
+    "license": "MIT",
+    "description": "ViT-base model trained on synthetic AI vs real images"
+  },
+  {
+    "key": "hf_deepfake",
+    "model_id": "dima806/deepfake_vs_real_image_detection",
+    "license": "Apache-2.0",
+    "description": "ViT-base model trained on real vs deepfake face swaps"
+  },
+  {
+    "key": "hf_community_forensics",
+    "model_id": "buildborderless/CommunityForensics-DeepfakeDet-ViT",
+    "license": "Apache-2.0",
+    "description": "Lightweight ViT deepfake detector trained on CommunityForensics dataset"
+  }
+]

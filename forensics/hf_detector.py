@@ -1,83 +1,109 @@
 """Hugging Face pretrained classifiers for AI-generated images and deepfakes.
 
-Integrates:
- - umm-maybe/AI-image-detector: detects diffusion / GAN / synthetic AI images
- - dima806/deepfake_vs_real_image_detection: detects deepfake / face-swap manipulations
+Configured via configs/detectors.json.
+Runs each detector on both:
+ 1. Full image (<key>_full)
+ 2. Face crop (<key>_face)
 """
+import os
+import json
 from typing import List, Optional
 import numpy as np
+import cv2
 from PIL import Image
 from .utils import Signal
+from .face import detect_face
 
-MODELS = {
-    "hf_ai_image": "umm-maybe/AI-image-detector",
-    "hf_deepfake": "dima806/deepfake_vs_real_image_detection",
-}
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "..", "configs", "detectors.json")
 
-# Forensic signal weight for the pretrained HF models (none should be display-only)
-HF_SIGNAL_WEIGHT = 2.0
-
-FAKE_KEYWORDS = ("fake", "artificial", "ai", "deepfake", "generated", "synthetic")
+def load_detector_config():
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Default fallback
+    return [
+        {"key": "hf_ai_image", "model_id": "umm-maybe/AI-image-detector"},
+        {"key": "hf_deepfake", "model_id": "dima806/deepfake_vs_real_image_detection"}
+    ]
 
 _PIPELINES = {}
 _PRINTED_LABELS = set()
+FAKE_KEYWORDS = ("fake", "artificial", "ai", "deepfake", "generated", "synthetic", "label_1")
 
-
-def _get_pipeline(name: str):
-    """Lazily load and cache the Hugging Face image classification pipeline."""
-    if name in _PIPELINES:
-        return _PIPELINES[name]
-    model_id = MODELS.get(name)
-    if not model_id:
-        return None
+def _get_pipeline(key: str, model_id: str):
+    if key in _PIPELINES:
+        return _PIPELINES[key]
     from transformers import pipeline
-    pipe = pipeline("image-classification", model=model_id)
-    _PIPELINES[name] = pipe
+    try:
+        # Try MPS first, fallback to CPU
+        import torch
+        device = "mps" if torch.backends.mps.is_available() else -1
+        pipe = pipeline("image-classification", model=model_id, device=device)
+    except Exception:
+        pipe = pipeline("image-classification", model=model_id, device=-1)
+    _PIPELINES[key] = pipe
     return pipe
 
-
 def _is_fake_label(label: str) -> bool:
-    """Check if label indicates synthetic / fake content and not real."""
     l = label.lower()
-    return any(k in l for k in FAKE_KEYWORDS) and "real" not in l
+    return any(k in l for k in FAKE_KEYWORDS) and "real" not in l and "human" not in l and "label_0" not in l
 
+def analyze_crop(pipe, pil_img, name: str, model_id: str) -> float:
+    results = pipe(pil_img, top_k=None)
+    if name not in _PRINTED_LABELS:
+        labels = [r["label"] for r in results]
+        print(f"[hf_detector] Model {name} ({model_id}) raw labels: {labels}")
+        _PRINTED_LABELS.add(name)
+
+    fake_prob = sum(float(r["score"]) for r in results if _is_fake_label(r["label"]))
+    return float(np.clip(fake_prob, 0.0, 1.0))
 
 def analyze(rgb: np.ndarray) -> List[Signal]:
-    """Analyze an RGB numpy array using Hugging Face classifiers.
-    
-    Returns a list of Signal objects (weight 2.0).
-    Wraps each model in try/except so a failed download or model never crashes the app.
-    """
     signals = []
-    pil_img = Image.fromarray(rgb)
+    pil_full = Image.fromarray(rgb)
+    
+    # Extract face crop
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+    box = detect_face(gray, rgb)
+    if box is not None:
+        x, y, w, h = box
+        face_rgb = rgb[max(0, y):min(rgb.shape[0], y+h), max(0, x):min(rgb.shape[1], x+w)]
+        pil_face = Image.fromarray(face_rgb) if face_rgb.size > 0 else pil_full
+    else:
+        # Center crop fallback
+        h, w = rgb.shape[:2]
+        ch, cw = int(h * 0.6), int(w * 0.6)
+        sy, sx = (h - ch) // 2, (w - cw) // 2
+        pil_face = Image.fromarray(rgb[sy:sy+ch, sx:sx+cw])
 
-    for name, model_id in MODELS.items():
+    configs = load_detector_config()
+
+    for item in configs:
+        key = item["key"]
+        model_id = item["model_id"]
         try:
-            pipe = _get_pipeline(name)
+            pipe = _get_pipeline(key, model_id)
             if pipe is None:
                 continue
 
-            results = pipe(pil_img, top_k=None)
-            
-            # Print raw labels once for debugging
-            if name not in _PRINTED_LABELS:
-                labels = [r["label"] for r in results]
-                print(f"[hf_detector] Model {name} ({model_id}) raw labels: {labels}")
-                _PRINTED_LABELS.add(name)
+            # Full image evaluation
+            fake_prob_full = analyze_crop(pipe, pil_full, f"{key}_full", model_id)
+            detail_full = f"HF detector ({key}_full): fake prob {fake_prob_full:.2f}."
+            signals.append(Signal(f"{key}_full", fake_prob_full, 1.0, detail_full))
 
-            # Fake probability is sum of scores for fake/ai/synthetic labels (excluding 'real')
-            fake_prob = sum(
-                float(r["score"]) for r in results if _is_fake_label(r["label"])
-            )
-            fake_prob = float(np.clip(fake_prob, 0.0, 1.0))
+            # Face crop evaluation
+            fake_prob_face = analyze_crop(pipe, pil_face, f"{key}_face", model_id)
+            detail_face = f"HF detector ({key}_face): fake prob {fake_prob_face:.2f}."
+            signals.append(Signal(f"{key}_face", fake_prob_face, 1.0, detail_face))
 
-            detail = (
-                f"HF detector ({name}): fake prob {fake_prob:.2f} "
-                f"({'AI/manipulated pattern' if fake_prob > 0.5 else 'natural capture pattern'})."
-            )
-            signals.append(Signal(name, fake_prob, HF_SIGNAL_WEIGHT, detail))
+            # Legacy fallback signal name for backward compatibility
+            if key in ["hf_ai_image", "hf_deepfake"]:
+                signals.append(Signal(key, fake_prob_full, 1.0, detail_full))
+
         except Exception as e:
-            # Model download failure or inference error should never crash the app
-            print(f"[warn] HF detector {name} failed: {e}")
+            print(f"[warn] HF detector {key} failed: {e}")
 
     return signals
